@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional model path passed to entropy extraction.",
     )
     parser.add_argument("--python", type=str, default=sys.executable, help="Python interpreter used to invoke scripts.")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size for entropy extraction inference.")
     return parser.parse_args()
 
 
@@ -62,6 +63,8 @@ def build_stage_cmd(stage: Stage, args: argparse.Namespace) -> list[str]:
             cmd.extend(["--model_name_or_path", args.model_name_or_path])
         if args.max_samples is not None:
             cmd.extend(["--max_samples", str(args.max_samples)])
+        if args.batch_size is not None:
+            cmd.extend(["--batch_size", str(args.batch_size)])
         return cmd
 
     if stage.key == "baseline":
