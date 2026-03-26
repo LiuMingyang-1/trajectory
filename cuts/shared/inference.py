@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
         choices=["float16", "bfloat16", "float32"],
     )
     parser.add_argument("--max_response_tokens", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--batch_report_interval", type=int, default=10)
     parser.add_argument(
         "--allow_partial",
@@ -145,14 +146,111 @@ def extract_entropy_for_record(
         "num_layers": int(entropy_matrix.shape[0]),
     }
 
-    del full_ids
-    del prompt_ids
-    del response_ids
-    del outputs
+    del full_ids, prompt_ids, response_ids, outputs
+    return result
+
+
+def _prepare_batch(
+    tokenizer: AutoTokenizer,
+    records: list[dict[str, Any]],
+    max_response_tokens: int,
+) -> tuple[list[torch.Tensor], list[int]]:
+    """Tokenize a batch of records, return per-sample full_ids and prompt_lens."""
+    all_ids: list[torch.Tensor] = []
+    prompt_lens: list[int] = []
+    for record in records:
+        full_prompt = build_chat_prompt(tokenizer, str(record["prompt"]))
+        prompt_ids = tokenize_text(tokenizer, full_prompt)
+        response_ids = tokenize_text(tokenizer, str(record["response"]), max_len=max_response_tokens)
+        full_ids = torch.cat([prompt_ids, response_ids], dim=0)
+        all_ids.append(full_ids)
+        prompt_lens.append(int(prompt_ids.numel()))
+    return all_ids, prompt_lens
+
+
+def _pad_and_batch(
+    all_ids: list[torch.Tensor],
+    pad_token_id: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Left-pad a list of 1-D id tensors into a batch with attention mask."""
+    max_len = max(ids.numel() for ids in all_ids)
+    batch_ids = torch.full((len(all_ids), max_len), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros(len(all_ids), max_len, dtype=torch.long)
+    for i, ids in enumerate(all_ids):
+        length = ids.numel()
+        # Left-pad: place content at the right end
+        batch_ids[i, max_len - length:] = ids
+        attention_mask[i, max_len - length:] = 1
+    return batch_ids.to(device), attention_mask.to(device)
+
+
+def extract_entropy_batch(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    records: list[dict[str, Any]],
+    device: str,
+    max_response_tokens: int,
+) -> list[dict[str, Any]]:
+    """Run a batched forward pass and compute per-layer entropy for each record."""
+    all_ids, prompt_lens = _prepare_batch(tokenizer, records, max_response_tokens)
+    seq_lens = [ids.numel() for ids in all_ids]
+
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    batch_ids, attention_mask = _pad_and_batch(all_ids, pad_token_id, device)
+    max_len = batch_ids.shape[1]
+
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=batch_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            output_attentions=False,
+            use_cache=False,
+            return_dict=True,
+        )
+
+    lm_head = model.get_output_embeddings()
+    if lm_head is None or not hasattr(lm_head, "weight"):
+        raise ValueError("Model does not expose output embeddings required for entropy projection.")
+
+    lm_weight = lm_head.weight
+    lm_bias = getattr(lm_head, "bias", None)
+
+    results: list[dict[str, Any]] = []
+    for i, record in enumerate(records):
+        # Because of left-padding, content starts at (max_len - seq_lens[i])
+        content_start = max_len - seq_lens[i]
+        response_start_in_padded = content_start + prompt_lens[i]
+
+        # Extract per-sample hidden states (single sample, no padding region)
+        sample_hidden_states = tuple(
+            hs[i:i+1, content_start:] for hs in outputs.hidden_states
+        )
+
+        entropy_matrix = compute_all_layer_entropies(
+            hidden_states=sample_hidden_states,
+            lm_head_weight=lm_weight,
+            lm_head_bias=lm_bias,
+            response_start=prompt_lens[i],
+            device=device,
+        )
+
+        n_response_tokens = seq_lens[i] - prompt_lens[i]
+        results.append({
+            "index": record["index"],
+            "candidate_index": record.get("candidate_index", 0),
+            "label": record["label"],
+            "entropy_scores": entropy_matrix.tolist(),
+            "num_response_tokens": n_response_tokens,
+            "num_layers": int(entropy_matrix.shape[0]),
+        })
+
+    del batch_ids, attention_mask, outputs
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    return result
+    return results
 
 
 def load_model(
@@ -199,6 +297,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     print(f"Loading model from {args.model_name_or_path}...")
     model = load_model(args.model_name_or_path, dtype, args.device)
@@ -206,44 +305,79 @@ def main() -> None:
 
     print(f"Loading ICR records from {args.icr_input_path}...")
     records = load_icr_records(Path(args.icr_input_path), args.start_index, args.max_samples)
-    print(f"Processing {len(records)} records...")
+    print(f"Processing {len(records)} records (batch_size={args.batch_size})...")
+
+    # Sort by total sequence length to minimize padding waste, track original order
+    indexed_records = list(enumerate(records))
+    indexed_records.sort(
+        key=lambda ir: len(str(ir[1].get("prompt", ""))) + len(str(ir[1].get("response", ""))),
+    )
 
     written = 0
     skipped = 0
     last_result: Optional[dict[str, Any]] = None
     skipped_examples: list[dict[str, Any]] = []
 
-    with output_path.open("w", encoding="utf-8") as fout:
-        for row_idx, record in enumerate(records, start=1):
-            try:
-                result = extract_entropy_for_record(
-                    model=model,
-                    tokenizer=tokenizer,
-                    record=record,
-                    device=args.device,
-                    max_response_tokens=args.max_response_tokens,
-                )
-                fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    # Collect results with original indices for ordered output
+    all_results: list[tuple[int, dict[str, Any]]] = []
+
+    total = len(indexed_records)
+    batch_size = args.batch_size
+
+    for batch_start in range(0, total, batch_size):
+        batch_indexed = indexed_records[batch_start:batch_start + batch_size]
+        batch_orig_indices = [idx for idx, _ in batch_indexed]
+        batch_records = [rec for _, rec in batch_indexed]
+
+        try:
+            batch_results = extract_entropy_batch(
+                model=model,
+                tokenizer=tokenizer,
+                records=batch_records,
+                device=args.device,
+                max_response_tokens=args.max_response_tokens,
+            )
+            for orig_idx, result in zip(batch_orig_indices, batch_results):
+                all_results.append((orig_idx, result))
                 written += 1
                 last_result = result
-            except Exception as exc:
-                record_index = int(record.get("index", row_idx - 1))
-                print(f"  WARNING: skipped record {record_index}: {exc}")
-                skipped += 1
-                if len(skipped_examples) < 10:
-                    skipped_examples.append(
-                        {
+        except Exception as exc:
+            # Fallback: try each record individually
+            for orig_idx, record in zip(batch_orig_indices, batch_records):
+                try:
+                    result = extract_entropy_for_record(
+                        model=model,
+                        tokenizer=tokenizer,
+                        record=record,
+                        device=args.device,
+                        max_response_tokens=args.max_response_tokens,
+                    )
+                    all_results.append((orig_idx, result))
+                    written += 1
+                    last_result = result
+                except Exception as inner_exc:
+                    record_index = int(record.get("index", orig_idx))
+                    print(f"  WARNING: skipped record {record_index}: {inner_exc}")
+                    skipped += 1
+                    if len(skipped_examples) < 10:
+                        skipped_examples.append({
                             "index": record_index,
                             "candidate_index": int(record.get("candidate_index", 0)),
-                            "error": str(exc),
-                        }
-                    )
+                            "error": str(inner_exc),
+                        })
 
-            if args.batch_report_interval > 0 and row_idx % args.batch_report_interval == 0:
-                print(f"  Processed {row_idx}/{len(records)}, written={written}, skipped={skipped}")
-                if last_result is not None:
-                    stats = entropy_summary_stats(np.asarray(last_result["entropy_scores"], dtype=np.float32))
-                    print(f"    Last sample entropy stats: {stats}")
+        processed = min(batch_start + batch_size, total)
+        if args.batch_report_interval > 0 and processed % (args.batch_report_interval * batch_size) < batch_size:
+            print(f"  Processed {processed}/{total}, written={written}, skipped={skipped}")
+            if last_result is not None:
+                stats = entropy_summary_stats(np.asarray(last_result["entropy_scores"], dtype=np.float32))
+                print(f"    Last sample entropy stats: {stats}")
+
+    # Write in original order
+    all_results.sort(key=lambda x: x[0])
+    with output_path.open("w", encoding="utf-8") as fout:
+        for _, result in all_results:
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     if skipped and not args.allow_partial:
         try:
